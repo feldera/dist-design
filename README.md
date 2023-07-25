@@ -10,7 +10,8 @@ in DBSP:
 
 The following features are out of scope:
 
-- Upgrade of computation, or other changes to a computation implemented in DBSP.
+- Upgrade of computation, or other changes to a computation or the
+  dataflow graph that implements it in DBSP.
 - Multiple connected pipelines.
 
 We aim to satisfy the following base requirements:
@@ -417,6 +418,10 @@ We can add or remove hosts in a "hot" fashion by:
 It's desirable to be able to upgrade the DBSP software without
 disrupting an ongoing computation.  This section describes two
 approaches.
+
+Rolling upgrade does not support changing the computation or the
+dataflow graph that implements it.  This procedure is for upgrades
+that, e.g., fix a security vulnerability.
 
 ## Via scale-in and scale-out
 
