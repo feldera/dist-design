@@ -34,6 +34,8 @@ in a single thread, passing data from "input handles" through
 "operators" to "output handles":
 
 ```
+[Figure 1]
+
          ┌────────────┐   ┌────────────┐   ┌────────────┐
 input───>│ operator 1 │──>│ operator 2 │──>│ operator 3 │───>output
          └────────────┘   └────────────┘   └────────────┘
@@ -57,6 +59,8 @@ function to obtain an equal distribution of keys.  The diagram below
 shows data being re-sharded before operators 2 and 3 execute:
 
 ```
+[Figure 2]
+
          ┌────────────┐   ┌────────────┐   ┌────────────┐
       ┌─>│ operator 1 │──>│ operator 2 │──>│ operator 3 │───>output
       │  └────────────┘\ /└────────────┘\ /└────────────┘
@@ -72,6 +76,8 @@ simply requires extending the "exchange" operator to work across hosts
 using RPC:
 
 ```
+[Figure 3]
+
          ╔══host 1═══════════════════════════════════╗
          ║   ┌────────────┐           ┌────────────┐ ║
       ┌─────>│ operator 1 │──┐     ┌─>│ operator 2 │───>output
@@ -245,7 +251,7 @@ For `seq` in `start_seq..`:
 
    This can be run in parallel across the individual workers.
 
-7. Read one event for `step` for each partition where we didn't
+7. Read one event from `step` for each partition where we didn't
    already read one in step 1 above, blocking as necessary.  Also
    block until our own write or writes to `step` commit.
    
