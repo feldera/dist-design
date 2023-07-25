@@ -190,16 +190,18 @@ On a given host, take the following variables:
   at the start of the partition.
 * `producer`, a Kafka producer for the same broker as `consumer`.
 
-Then:
+On each worker:
 
-- Open the state database.  Follow the [procedure](rocksdb.md) to get
-  this worker's state in sync with all of the other workers.  Call
-  that step `start_seq`.
+- Open the state database and get this worker's state in sync with all
+  of the other workers.  Call that step `start_seq`, which will
+  naturally be the same across all workers.  See [Coordinated
+  commit](rocksdb.md#coordinated-commit) for details for two ways to
+  do this.
   
 - Open a transaction on the state database (if one isn't already
   open).
   
-For `seq` in `start_seq..`:
+Then on the host, for `seq` in `start_seq..`:
 
 1. Put data into the circuit for this step.  First, attempt to read
    one event from each partition in `workers` from `step`:
