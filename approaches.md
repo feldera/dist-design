@@ -25,14 +25,14 @@ handles.  We use the following Kafka topics, each with `W` partitions:
   in each of these topics.  Whatever is reading output from DBSP reads
   from these topics.
 
-* `step`.  Each event is an `H`-element array of event offsets.
+* `input-step`.  Each event is an `H`-element array of event offsets.
   If `offsets[]` is the array in the event in partition `w` with event
   offset `seq`, then worker `w` included `input[h]` up to `offsets[h]`
   in its computations for sequence number `seq`.
 
   There is a required invariant: if `e` is the least number of events
-  in any partition in `output`, then every partition in `step` has at
-  least `e` events.
+  in any partition in `output`, then every partition in `input-step`
+  has at least `e` events.
   
 On a given host, take the following variables:
 
@@ -41,14 +41,14 @@ On a given host, take the following variables:
 * `input_handles`, the vector of `H` `CollectionHandle` input handles.
 * `output_handles`, the vector of `K` `OutputHandle` output handles.
 * `consumer`, a Kafka consumer, subscribed to partitions `workers` in
-  `input[*]` and to all partitions in `step`, all initially positioned
-  at the start of the partition.
+  `input[*]` and to all partitions in `input-step`, all initially
+  positioned at the start of the partition.
 * `producer`, a Kafka producer for the same broker as `consumer`.
 
 For `seq` in `0..`:
 
 1. Put data into the circuit for this step.  First, attempt to read
-   one event from each partition in `workers` from `step`:
+   one event from each partition in `workers` from `input-step`:
 
    * If we get an event for one or more of the workers, then we're
      replaying the log after restarting.  In this case, there will
@@ -67,10 +67,10 @@ For `seq` in `0..`:
 
    * Otherwise, if we didn't get any events, we're running normally
      instead of replaying.  Block until we read one event from any
-     partition in `step` or until we can read any number of events
+     partition in `input-step` or until we can read any number of events
      from partitions `workers` in `input[*]`.
 
-     If we read any events from `step` in any partition in `workers`,
+     If we read any events from `input-step` in any partition in `workers`,
      that's a fatal error.  It means that some other process is
      running as one of our workers.
 
@@ -78,9 +78,9 @@ For `seq` in `0..`:
      anything) from `input[h]` in partition `w` to input handle `h`
      for worker `w`.
 
-     For `w` in `workers`, write to `step` what we just fed to the
-     circuit.  (We need to commit this write immediately, so that the
-     other hosts can read it before they commit their `output`
+     For `w` in `workers`, write to `input-step` what we just fed to
+     the circuit.  (We need to commit this write immediately, so that
+     the other hosts can read it before they commit their `output`
      changes.  Otherwise, we could violate the invariant.)
    
    This step can mostly be parallelized into the individual workers,
@@ -94,12 +94,13 @@ For `seq` in `0..`:
    handle `k` in worker `w` to partition `w` of `output[k]`, unless
    that output was already produced in a previous run.
 
-7. Read one event for `step` for each partition where we didn't
+7. Read one event for `input-step` for each partition where we didn't
    already read one in step 1 above, blocking as necessary.  Also
-   block until our own write or writes to `step` commit.
+   block until our own write or writes to `input-step` commit.
    
-   This is necessary because we need all of `step` to commit before
-   any of `output[*]`.  Otherwise, we could violate the invariant.
+   This is necessary because we need all of `input-step` to commit
+   before any of `output[*]`.  Otherwise, we could violate the
+   invariant.
 
 8. Commit the Kafka transaction.
 
