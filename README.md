@@ -212,7 +212,7 @@ to trigger a step.  Two approaches come to mind:
   consume all of the data from all of partitions in `input[0]`, which
   would be a bottleneck.  (Kafka would allow a coordinator to
   periodically poll all the partitions for new data without consuming
-  it, so this could
+  it, which would work at the added expense and latency of polling.)
 
 * **Distributed trigger**, in which each host waits until it is
   independently ready to trigger a step.  When a host is ready, it
