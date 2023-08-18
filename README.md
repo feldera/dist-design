@@ -102,446 +102,231 @@ input─┤                        ├─┤
 
 # Fault tolerance
 
-To gracefully resume a computation, DBSP requires a consistent
-snapshot of the following between two steps of the computation:
-
-1. **Input** obtained from a data source but not yet processed.
-2. **State** inside the circuit across all the workers.
-3. **Output** produced by the circuit in a previous step but not yet
-   acknowledged by its destination.
-
-We need the input, output, and state captured at the same step, or to
-be able to recompute them.  There are multiple ways to achieve this,
-as summarized in [Fault Tolerance Approaches](approaches.md).  We
-adopt the approach called "persistent state" there.
-
-In the persistent state approach, each worker maintains a local
-database of the circuit's state.  Each step updates the local
-database.  Occasionally, a coordinator tells all of the workers to
-commit their databases in a coordinated way.
-
-In this approach, to recover from a fault, all of the workers load the
-most recently committed state snapshot and replay the input starting
-from that point, discarding any duplicate output that this produces.
-
-The following sections describe some details for input and output and
-state.
-
-## Input and output
-
-We adopt Apache Kafka for input and output.  Kafka is already widely
-used for data streaming, which makes it an appropriate and familiar
-interface for users.  Please refer to [Understanding Kafka](kafka.md)
-for relevant information about Kafka.
-
-In particular, for DBSP, suppose we have `W` workers, `H` input
-handles, and `K` output handles.  We use the following Kafka topics,
-each with `W` partitions[^1]:
-
-* `input[0]` through `input[H-1]`.  Whatever is providing input to DBSP
-  writes to these topics.  Worker `w` reads from partition `w` in each
-  of these topics.
-
-* `output[0]` through `output[K-1]`.  Worker `w` writes to partition
-  `w` in each of these topics.  Whatever is reading output from DBSP
-  reads from these topics.  The producer tags each event, in a [Kafka
-  header](kafka.md#events), with the sequence number of the step that
-  produced it.
-
-We also need to keep track of how the input was divided up into
-batches for the computation.  We use another Kafka topic with `W`
-partitions for this:
-
-* `input-step`.  Each event is an `H`-element array of event offsets.
-  If partition `w` with event offset `seq` holds such an array
-  `offsets[]`, then worker `w` included `input[h]` up to `offsets[h]`
-  in its computations for sequence number `seq`.
-
-  There is a required invariant: if `e` is the least number of events
-  in any partition in `output`, then every partition in `input-step`
-  has at least `e` events.
-
-To a lesser extent, we also need to keep track of which step sequence
-number corresponds to which output.  Tagging `output[*]` with a Kafka
-header as described above may be sufficient.  If necessary, we can add
-another Kafka topic with `W` partitions:
-
-* `output-step`: Each event is an `K`-element array of event offsets.
-  If partition `w` with event offset `seq` holds such an array
-  `offsets[]`, then worker `w` produced `output[k]` up to `offsets[k]`
-  as output for the step with sequence number `seq`.
-
-[^1]: Section [Scale in and out](#scale-in-and-out) generalizes to the
-    case where the number of Kafka partitions differs from the number
-    of workers.
-
-## State
-
-To store operator state, we adopt RocksDB, a key-value store library
-that supports data larger than memory.  RocksDB offers atomic
-transactions with write-ahead logging.  RocksDB does not have a
-built-in way to implement atomic transactions across a DBSP cluster,
-but we can layer them on top.  See [Understanding RocksDB](rocksdb.md)
-for details.
-
-RocksDB works on local storage.  Each worker needs its own durable
-local storage, and loss or corruption of any worker's storage corrupts
-the whole computation.  We could instead use a distributed database
-that includes fault tolerance of its own.  FoundationDB is a good
-candidate.
-
-## Triggering DBSP steps
-
-DBSP steps work on batches of input data.  The workers must agree when
-to trigger a step.  Two approaches come to mind:
-
-* **Centralized trigger**, in which a coordinator tells each host to
-  trigger a step and how much data to include in the step.  To trigger
-  a step, the coordinator produces an event to each partition in
-  `input-step`, and each host consumes the partitions for its own
-  workers.
-
-  With this approach, it is conceptually simple to trigger a step
-  based on properties that span all the workers, such as "`input[0]`
-  received at least 1000 events total across all its partitions".
-
-  This approach does not seem well suited for Kafka, because Kafka
-  does not appear to support monitoring a partition for new data
-  without reading the data from that partition.  Thus, a coordinator
-  that wanted to evaluate a property like the one above would have to
-  consume all of the data from all of partitions in `input[0]`, which
-  would be a bottleneck.  (Kafka would allow a coordinator to
-  periodically poll all the partitions for new data without consuming
-  it, which would work at the added expense and latency of polling.)
-
-* **Distributed trigger**, in which each host waits until it is
-  independently ready to trigger a step.  When a host is ready, it
-  produces an event into the partitions for its workers in
-  `input-step`.  Each host also waits for other hosts to produce
-  events into their partitions and, as soon as any one of them does,
-  it produces an event into the partitions for its own workers.  Thus,
-  a step begins as soon as any one of the hosts is ready.
-
-  In this approach, it is hard to step based on a property that spans
-  all the workers.  To do so, one could introduce extra communication
-  among the hosts or with a coordinator.
-
-  This approach should work well with Kafka.  All the hosts need to
-  consume all of the partitions in `input-step`, but this should not
-  increase network traffic very much because their events should be
-  small arrays of event offsets.
-
-We adopt the distributed trigger approach for the reasons described
-above.
-
-## Algorithm
-
-On a given host, take the following variables:
-
-* `workers`, the set of workers on the host.
-* `dbsp`, the `DBSPHandle` for the host's multithreaded circuit runtime.
-* `input_handles`, the vector of `H` `CollectionHandle` input handles.
-* `output_handles`, the vector of `K` `OutputHandle` output handles.
-* `output_tail[*]`, a `K`-element vector.  Each element of
-  `output_tail[k]` is a map from each worker `w` in `workers` to the
-  sequence number of the last step that appears in `output[k]` in
-  partition `w`.  (These can be obtained by reading the sequence
-  number header in the last event in each partition in `output[k]`.)
-* `consumer`, a Kafka consumer, subscribed to partitions `workers` in
-  `input[*]` and to all partitions in `input-step`.
-* `producer`, a Kafka producer for the same broker as `consumer`.
-
-On each worker:
-
-- Open the state database and get this worker's state in sync with all
-  of the other workers.  Call that step `start_seq`, which will
-  naturally be the same across all workers.  See [Coordinated
-  commit](rocksdb.md#coordinated-commit) for details for two ways to
-  do this.
-
-- Open a transaction on the state database (if one isn't already
-  open).
-
-- Seek `consumer` in every partition of `input-step` to `start_seq`.
-  This is either the offset of an event that exists, or just past the
-  end.  If it's later than that, or if it's so early that Kafka
-  already expired it, that's a fatal error.
-
-- Seek `consumer` in every subscribed partition of `input[*]` to the
-  position that corresponds to `start_seq`.  (To find this position,
-  we actually need to read the event with event offset `start_seq - 1`
-  in `input-step`.)
-
-Then on the host, for `seq` in `start_seq..`, repeat the following.
-At the beginning of each iteration, `consumer` is positioned at event
-offset `seq` in every partition of `input-step` and at the offset
-corresponding to `seq` in the subscribed partitions in `input[*]`.
-
-1. Put data into the circuit for this step.  First, attempt to read
-   one event from each partition in `workers` from `input-step`, to obtain
-   the input step size for `seq`:
-
-   * If we get an event for one or more of the workers, then we're
-     replaying the log after restarting.  In this case, there will
-     normally be an event for all of the workers but, if there was a
-     failure, we might have an event in only some of them.  To handle
-     that, we write an event to each partition that lacked one.  It's
-     easiest to just fill them in as "empty", indicating that no data
-     is to be included in those workers for this step, and it seems
-     like we might as well do that because this case occurs at most
-     once per program run.
-
-     For `h` in `0..H`, for `w` in `workers`, read as much data from
-     `input[h]` in partition `w` as `input-step` said (or nothing, if
-     we filled it in as empty), and feed it to input handle `h` for
-     worker `w`.
-
-     Afterward, our consumer in `input-step` is at offset `seq + 1` in
-     the partitions in `workers`, and `seq` in the rest.
-
-   * Otherwise, if we didn't get any events, we're running normally
-     instead of replaying.  Block until we read one event from any
-     partition in `input-step` or until we can read any number of
-     events from partitions `workers` in `input[*]`.
-
-     If we read any events from `input-step` in any partition in
-     `workers`, that's a fatal error.  It means that some other
-     process is running as one of our workers.
-
-     For `h` in `0..H`, for `w` in `workers`, feed what we got (if
-     anything) from `input[h]` in partition `w` to input handle `h`
-     for worker `w`.
-
-     For `w` in `workers`, write to `input-step` what we just fed to
-     the circuit.  (We need to write this immediately, because the
-     other hosts cannot continue past step 7 before before they read
-     it.)
-
-     Afterward, our consumer in `input-step` is at offset `seq + 1`
-     for `workers` and at least one other partition, and `seq` in any
-     others.
-
-   This step can mostly be parallelized into the individual workers,
-   but some care is needed for the blocking part in the "normal" path.
-
-4. Run the DBSP circuit for one step, using and updating state from
-   the state database.  The DBSP circuit coordinates across all of the
-   workers on all of the hosts, exchanging data as necessary.
-
-5. Start a Kafka transaction.
-
-6. For `k` in `0..K`, for `w` in `workers`, write data from output
-   handle `k` in worker `w` to partition `w` of `output[k]`, unless
-   `seq <= output_tail[k][w]`[^2].  If we decide that `output-step`
-   should exist, also write an event to partition `w` of
-   `output-step`.
-
-   This can be run in parallel across the individual workers.
-
-7. Our consumer in `input-step` is at offset `seq + 1` in some
-   partitions and may be at offset `seq` in others.  In the partitions
-   where we're at offset `seq`, if any, read one event, blocking as
-   necessary.  Afterward, the consumer is now at offset `seq + 1` in
-   every partition.
-
-   Also block until our own write or writes to `input-step` commit.
-
-   This is necessary because we need all of `input-step` to commit
-   before any of `output[*]`.  Otherwise, we could violate
-   `input-step`'s invariant.
-
-8. Commit the Kafka transaction.
-
-9. If there's a coordinated commit request from the coordinator, then
-   commit the state database and report that it's complete.  (The host
-   may still commit in the absence of a commit request, as long as the
-   database implementation can still roll back to the most recently
-   coordinated commit.)
-
-[^2]: If `seq <= output_tail[k][w]`, then this output was already
-produced in a previous run.  DBSP is designed to produce deterministic
-output, so in this case we could read the old output and compare it
-against the new and issue a warning or a fatal error if it differs.
-
-# Scale in and out
-
-The computational resources in our distributed system are hosts and
-workers.  Distributed DBSP should support "scale out" to increase
-workers and hosts and "scale in" to decrease them.
-
-## Data partitioning for scale-in/out
-
-Given a particular number of workers `W`, the leading question for
-scale-in/out is how to distribute and re-distribute data among the
-workers for efficient processing.  The following sections describe
-strategies for DBSP input and output and for the exchange operator.
-
-### Input and output
-
-We have described distributed DBSP such that the number of workers `W`
-equals the number of partitions `P` in each Kafka topic for input and
-output.  It is impractical to maintain this invariant as `W` increases
-and decreases over time, especially since Kafka allows the admin to
-increase, but not decrease, the number of partitions in a topic.
-
-Thus, we propose for a distributed DBSP deployment to fix `P` at
-creation time.  `P` should be greater than or equal to the anticipated
-maximum number of workers, but not so large as to waste disk space on
-the Kafka brokers.  `P = 64` seems like a reasonable initial choice.
-
-We must assign each partition to a worker.  If `P > W`, then at least
-some workers will accept input data from multiple partitions, and if
-`P < W`, then some workers will not accept data directly from any
-partitions.  In the latter case, or if `P` is not a multiple of `W`,
-the distribution of input data across workers will be unbalanced.
-
-> 💡 This discussion assumes that every input and output uses the same
-> number of partitions and same partition assignment.  That seems like
-> a reasonable place to start.  However, we could support separate
-> partition counts for inputs and outputs, or for each input and
-> output.
-
-DBSP does not assume anything about how producers distribute data
-among input partitions.  For example, it does not assume that related
-data are produced into the same partition.
-
-### Exchange
-
-The "exchange" operator described in [Distribution of
-computation](#distribution-of-computation) rebalances data by
-redistributing keys across workers.  However, computations that use an
-exchange also maintain state about data streams that must reside in
-the same worker that the stream flows through.  When scale-in/out
-adjusts exchanges to send data to different workers, the associated
-state must also move and, to make scale-in/out faster, we want to move
-as little as possible.
-
-> 💡 If DBSP maintains state in a distributed database, instead of a
-> per-worker local database, then DBSP itself doesn't need to
-> explicitly move state data around, but the database still needs to
-> do it.
-
-DBSP currently divides data in exchange by hashing each key and taking
-`hash % W` as a worker index.  This is a worst case for moving state:
-when the number of workers increases from `W` to `W+1`, `W/(W+1)` of
-the state moves.
-
-DBSP could reuse the mapping from Kafka partitions to workers, by
-taking `hash % P` as a partition number and then using the same
-partition-to-worker assignment as for input and output.  If `P < W` or
-if `P` is not a multiple of `W`, this causes the same kind of
-unbalanced distribution as already described for input and output.  We
-can do better, because exchange lacks Kafka's disk space and scaling
-constraints.
-
-Let `S` be the number of "shards" for the exchange operator to divide
-data into.  Then the following algorithms seem like reasonable ones:
-
-* Fixed sharding: Choose a relatively large number `S`, e.g. 1024, of
-  "shards", numbered `0..S`.  Initially, for `W` workers, assign
-  approximately `S/W` shards to each worker, e.g. `0..333`,
-  `333..666`, and `666..1000` for `S = 1000` and `W = 3`.  To add a
-  new worker, assign it approximately `1/S` shards, taking them from
-  the existing workers so that the new division is approximately even,
-  e.g. a fourth worker might receive shards `0..83`, `333..416`, and
-  `666..750`.
-
-  This algorithm reassigns a minimum amount of traffic when `W`
-  changes.  As `W` approaches `S`, it divides data more and more
-  unevenly.  It requires a `S`-sized array to express the assignments.
-
-  This is essentially the same as the Kafka partitioning algorithm,
-  but we can afford for `S` to be larger than `P`.
-
-* Dynamic sharding: Choose `0 < k < 1` as the maximum inaccuracy in
-  sharding to tolerate, e.g. `k = 0.1` for 10% inaccuracy.  Let the
-  number of shards `S` be `(W/k).next_power_of_two()`.  Assign
-  approximately `S/W` shards to each worker.  To increase or decrease
-  the number of workers by 1, first recalculate `S`.  If this doubles
-  `S`, then double the bounds of every existing shard slice, so that,
-  e.g., `333..416` becomes `666..832`.  If this halves `S`, then halve
-  the bounds (and adjust assignments, if necessary, for a minimum
-  amount of disruption).  After adjusting `S`, assign workers to
-  shards such that the division is approximately even.
-
-  With this algorithm, shard data using the shard assigned to the data
-  hash's `S.ilog2()` most-significant bits.
-
-  This algorithm reassigns a minimum amount of traffic when `W`
-  changes.  It requires a `S`-sized array to express the assignments
-  (but the array size adapts appropriately for `W` and `k`).
-
-Fixed partitioning requires one to choose `S` appropriately, which
-might be hard.  Dynamic partitioning seems like a good approach.  It
-might take some work to implement it exactly correctly (it is possibly
-a novel algorithm), so it might not be worth implementing initially.
-
-The choice of algorithm only matters for adding or removing a few
-hosts at a time.  If the number of workers changes by more than 2× up
-or down, then most of the data needs to move anyway, which means that
-the choice of algorithm does not matter.
-
-## Layout changes
-
-We call the assignment of partitions and shards to workers, and
-workers to hosts a "layout".  Scale-in and scale-out are both examples
-of layout changes.
-
-Given fault tolerance, we can change the layout in a "cold" fashion
-by:
-
-1. Terminate DBSP workers for the old layout.
-2. Redistribute state as necessary.
-3. Start DBSP workers with the new layout.
-
-We can add or remove hosts in a "hot" fashion by:
-
-1. Start the hosts to be added, if any.
-2. Start copying state as necessary, while the circuit continues
-   executing.
-3. Stop the workers that are to be removed, initialize the workers
-   that are to be added, and pause the others.
-4. Finish copying the state.
-5. Update the assignment of partitions and shards to workers.
-6. Start the workers to be added, and un-pause the others.
-7. Stop the hosts to be removed.
-
-# Rolling upgrade
-
-It's desirable to be able to upgrade the DBSP software without
-disrupting an ongoing computation.  This section describes two
-approaches.
-
-Rolling upgrade does not support changing the computation or the
-dataflow graph that implements it.  This procedure is for upgrades
-that, e.g., fix a security vulnerability.
-
-## Via scale-in and scale-out
-
-Rolling upgrade of DBSP can leverage scale-out and scale-in as
-primitive operations.  This approach works if a spare host is
-available for the upgrade:
-
-1. Add a new host to the computation, using the new version of DBSP.
-2. Remove a host using the old version of DBSP.
-3. If any hosts remain using the old version, start over from step 1.
-
-If no spare host is available, swap steps 1 and 2.
-
-## Via layout change
-
-Iterative rolling upgrade, as described in the previous section, moves
-all DBSP state at least twice: step 1 moves `1/n` of the data to the
-added host, step 2 moves `1/n` of the data from the removed host, and
-the process is repeated `n` times.
-
-However, the layout change process is more general.  In a single step,
-one can add host A and remove host B and ensure that the data assigned
-to B is now assigned to A, so that only `1/n` of the data needs to
-move.  Over `n` iteration, only half as much data moves.  One could
-also do a single step that removes all of the old hosts and adds all
-of the new ones.
-
-Furthermore, if a given host has enough memory and other resources,
-one could start the new DBSP processes on the same hosts as the old
-ones and use a layout change that avoids moving any data at all.
+For fault tolerance, each worker maintains a database with the
+circuit's state.  Occasionally, a coordinator tells all of the workers
+to commit their databases way.  To recover from a fault, all of the
+workers load the most recently committed state snapshot and replay the
+input starting from that point, discarding any duplicate output that
+this produces.
+
+Input must be stored durably at least the latest snapshot has gone
+past it.
+
+## Database
+
+Each worker has a database with a key-value interface.  The database
+must support up to two versions of data.  Let `Version` be a `u64`
+type representing a database version serial number:
+
+  * A new database has only one version, numbered 0, which is empty.
+
+  * Opening a database at any given version causes the other version,
+    if any, to be discarded.
+
+  * Committing a database that was opened with `open(version)` creates
+    a new version `version + 1`, either of which may be opened with
+    `open`.
+    
+  * A database closed by a crash or in any way other than `commit`
+    retains the version that was passed to `open()`.  If a crash
+    happens during `commit` then it's OK for both versions or just the
+    vesion passed to `open()` to be available on recovery.
+
+* `fn versions() -> Range<Version>`
+
+  Reports the versions that the database can open.  The returned
+  `Range` has length 1 or 2.
+  
+* `fn open(version: Version) -> Result<Database>`
+
+  Opens the database at the specified `version`.  The database
+  discards versions other than `version`.
+  
+* `fn commit(db: Database) -> Result<()>`
+
+  Commits the current version of `db` and closes the database.
+  
+* `fn get(db: &mut Database, table, key) -> Result<value>`  
+  `fn put(db: &mut Database, table, key, value) -> Result<()>`
+
+  Key-value pair read and write.
+  
+* `fn get_step(db: &Database) -> Result<Step>`  
+  `fn set_step(db: &mut Database, step: Step) -> Result<()>`
+
+  Helpers for reading and writing the step number for the next
+  step to be applied.
+
+## Input
+
+Input and output are divided into numbered steps.  Let `Step` be a
+`u64` type representing an input or output step.
+
+Each worker needs to obtain input for each step.  Input must be logged
+durably.  The assignment of input to a particular step must also be
+durable; for example, a crash must not cause additional data (that
+arrived post-crash, for example) to become part of a step.
+
+Input only need be durable until its step has become committed to the
+earliest version in its local database.
+
+Consider a worker to have input for steps `first..last`.  This might
+be an empty range if no new input has arrived since the earliest
+version of the local database.
+
+* `fn read(step: Step) -> Result<Vec<ZSet>>`
+
+  Reads input for step number `step`, which must be in `first..=last`,
+  that is, either a step currently in the log or just after.  In the
+  latter case, the function blocks until input arrives.
+
+  Returns a Z-set per input handle.  If a single step batches input
+  from multiple event arrivals for a given input handle, they are
+  added together into a Z-set.
+  
+## Output
+
+Each worker needs to produce output for each step.  DBSP can reproduce
+output for steps since the earliest version in any of the workers'
+databases.
+
+The need for output durability depends on the requirements of the
+systems that consume DBSP's output.  Those systems can also apply
+their own expiration or deletion policies to output.
+
+Consider a worker to have output for steps `first..last`, which might
+be an empty range.
+
+* `fn write(step: Step, output: Vec<ZSet> -> Result<()>`
+
+  Writes `output` as the output for step number `step`:
+  
+    * If `step` is in the range `0..first`, then `output` has already
+      been produced before and discarded or deleted.  Discard it.
+      
+    * If `step` is in the range `first..last`, then `output` has
+      already been produced before.  Now it has been produced
+      redundantly during recovery.  Optionally, check that the new
+      output matches the old output and warn if it differs.  Discard
+      `output`.
+
+    * If `step == last`, then append it to the output stream and
+      increment `last`.
+    
+    * `step > last` is an error.
+    
+## Worker
+
+A worker has the following interface:
+
+* `fn versions() -> Range<Version>`
+
+  Delegates to the local database.
+  
+* `fn start(version: Version)`
+
+  Opens the local database with `open(version)`.  Sets a local
+  variable `step` using `get_step()` from the database.  Set `state`
+  to `Run`.
+  
+  Repeat the following loop until the coordinator calls `stop()`:
+  
+  - Get input by calling `read(step)`.
+  
+  - Run the circuit for one step, obtaining `output`.  The DBSP
+    circuit coordinates across all of the workers on all of the hosts,
+    exchanging data as necessary.
+
+  - Write output by calling `write(step, output)`.
+  
+  - Increment `step`.
+  
+  Store `step` into the database using `set_step()`.  Commit the
+  database with `commit()`.  Set `state` to `Stopped`.
+  
+* `fn stop()`
+
+  Stops the loop in `start()`.
+  
+## Coordinator
+
+In a loop:
+
+- Call `versions()` on each worker to get its database version range,
+  intersects the results, and takes the maximum value `v`[^1].
+  
+  If this is not the first iteration of the loop, `v` should be one
+  more than in the previous iteration.
+  
+  [^1]: If the intersection is the empty set, that's a fatal error.
+
+- Call `start(v)` on each worker.
+
+- Wait for an appropriate interval between checkpoints.
+
+- Call `stop()` on each worker.
+
+## Synchronization details
+
+<details><summary>Synchronization details</summary>
+
+We need some synchronization to allow all the workers to pause at the
+same step without blocking.  Here's one possible approach.
+
+Give each worker a cancellation token `token`, something like
+[`tokio_util::sync::CancellationToken`][1], plus a `state`:
+
+```
+enum State {
+    Run,
+    Pause,
+    Paused(Step),
+    Stop(Step),
+    Stopped,
+}
+```
+
+At the top of the loop in `start()`, instead of just getting input,
+consult `state`:
+
+* If `state` is `Run`, which is the common case, get input by
+  calling `read(step, &token)`.
+
+* If `state` is `Pause`, set it to `Paused(step)` and block until it
+  becomes `Stop(_)`.
+
+* If `state` is `Stop(x)`:
+
+  - If `step < x`, get input by calling `read(step, &token)`.
+
+  - If `step == x`, break out of the loop.
+
+  - If `step > x`, fatal error.
+
+Refine the worker interface with:
+
+* `fn pause() -> Step`
+
+  Sets `state` to `Pause`.  Cancel `token`.  Block until `state`
+  becomes `Paused(step)` and return `step`.
+
+* `fn stop(step: Step)`
+
+  Sets `state` to `Stop(step)`.  Blocks until `state` becomes
+  `Stopped`.
+
+Refine the coordinator by, instead of just calling `stop()` on each
+worker:
+
+- Call `pause()` on each worker and take `step` as the maximum
+  return value.
+  
+- Call `stop(step)` on each worker.
+
+Refine the input interface by making `read()` take the cancellation
+token and block until input arrives or `token` is cancelled, whichever
+comes first.
+</details>
+
+[1]: https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html
+
