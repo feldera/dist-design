@@ -277,7 +277,7 @@ A worker presents the following interface to the coordinator:
   - Increments `step`.
   
   Stores `step` into the database using `set_step()`.  Commits the
-  database with `commit()`.  Sets `state` to `Stopped`.
+  database with `commit()`.
   
 * `fn stop()`
 
@@ -319,22 +319,27 @@ Furthermore, for a given step, it must become durable before or at the
 same time as the step's output (otherwise, we could have output that
 we don't know how to reproduce).  There are a few ways:
 
-- The Input implementation could block until the division of input
-  commits before returning.  This would add latency.
+- The Input implementation could block until recording the division of
+  input commits before returning.  This would add latency.
 
-- Input could provide a function to block until the division of input
-  commits.  The worker could call this after running the circuit.
-  This would help to hide the latency.
+- Input could provide a function to block until recording the division
+  of input commits.  The worker could call this after running the
+  circuit.  This would help to hide the latency.
 
 - If the Input and Output implementations use underlying tech that
   allows it, they could cooperate to use a transaction to atomically
-  commit the division of input and output.
+  commit the division of input and output.  This will work if the
+  input and output are in the same Kafka broker.
 
 #### Alternate design approach
 
-<details>In the system as described, a step has well-defined input and
+We can avoid the need for synchronization if we drop some
+requirements.
+
+<details><summary>Details</summary>
+In the system as described, a step has well-defined input and
 output, with the output always corresponding to the input.  Suppose we
-relax our definitions to allow a crash to input to move from one step
+relax our definitions to allow a crash to move input from one step
 to another (but not across checkpoints).  Then, recovery would read
 the output that was produced beyond the checkpoint, run the circuit
 with the input produced beyond the checkpoint, and then write as
@@ -372,9 +377,9 @@ enum State {
 }
 ```
 
-`start()` initially sets its local variable `state` to `Run`.  Then,
-at the top of its loop, instead of just getting input, it consults
-`state`:
+`start()` sets its local variable `state` to `Run` when it starts and
+to `Stopped` just before it returns.  At the top of its internal loop,
+instead of just getting input, it consults `state`:
 
 * If `state` is `Run`, which is the common case, gets input by
   calling `read(step, &token)`.
@@ -424,9 +429,6 @@ workers.  Distributed DBSP should support "scale out" to increase
 workers and hosts and "scale in" to decrease them.  For performance,
 input and state should be divided more or less evenly across workers
 regardless of the current scale.
-
-We have described distributed DBSP state, input, and output in
-abstract terms.  We need to be more specific about them for scaling.
 
 For [input/output synchronization](#inputoutput-synchronization),
 scale must be fixed at a given checkpoint.  That is, if a checkpoint
@@ -533,7 +535,7 @@ The choice of algorithm only matters for adding or removing a few
 hosts at a time.  If the number of workers changes by more than 2× up
 or down, then most of the data needs to move anyway, which means that
 the choice of algorithm does not matter.
-</summary>
+</details>
 
 ## Layout changes
 
