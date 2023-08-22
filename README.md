@@ -194,21 +194,8 @@ to obtain input for the step.  To ensure that recovery always produces
 the same output as previous runs, the input for a given step must be
 fixed.  That means that input must be logged durably.
 
-<details><summary>The division of input between steps must also be
-durable.</summary> That is, a crash must not move input from one step
-to another, even though such a change would ordinarily not change the
-integral of the distributed circuit output following the steps that
-changed.  This is because output may already have been produced for
-one (or more, or even all) workers for steps being replayed.
-
-> 💡 If this requirement yields performance or other problems, then it
-could be eliminated by complicating the recovery process.  Recovery
-would read the output that was produced beyond the checkpoint, run the
-circuit with the input produced beyond the checkpoint, and then
-produce as output the difference between the new output and the
-previously produced output.  This would ensure that the integral of
-the output is correct, but the output for the individual steps
-involved in recovery could be inconsistent with the input.</details>
+The division of input between steps must also be durable (see
+[Input/output synchronization](#inputoutput-synchronization)).
 
 Input only need be durable until its step has become committed to the
 earliest version in its local database.
@@ -283,7 +270,8 @@ A worker presents the following interface to the coordinator:
     circuit coordinates across all of the workers on all of the hosts,
     exchanging data as necessary.
 
-  - Writes output by calling `write(step, output)`.
+  - Writes output by calling `write(step, output)` (but see
+    [Input/output synchronization](#inputoutput-synchronization)).
   
   - Increments `step`.
   
@@ -311,12 +299,61 @@ In a loop:
 
 - Calls `stop()` on each worker.
 
-## Synchronization details
+## Synchronization
+
+### Input/output synchronization
+
+[Input](#input) mentioned that the division of input between steps
+must be durable.  That is, a crash must not move input from one step
+to another, even though such a change would ordinarily not change the
+integral of the distributed circuit output following the steps that
+changed.  This is because output may already have been produced for
+one (or more, or even all) workers for steps being replayed, and
+moving input from one step to another would potentially require some
+of that already-produced output to change, which cannot be done.
+
+In practice, making the division of input into steps durable seems to
+require recording it, in the [Input](#input) implementation.
+Furthermore, for a given step, it must become durable before or at the
+same time as the step's output (otherwise, we could have output that
+we don't know how to reproduce).  There are a few ways:
+
+- The Input implementation could block until the division of input
+  commits before returning.  This would add latency.
+
+- Input could provide a function to block until the division of input
+  commits.  The worker could call this after running the circuit.
+  This would help to hide the latency.
+
+- If the Input and Output implementations use underlying tech that
+  allows it, they could cooperate to use a transaction to atomically
+  commit the division of input and output.
+
+<details><summary>Alternate design approach</summary>
+
+In the system as described, a step has well-defined input and output,
+with the output always corresponding to the input.  Suppose we relax
+our definitions to allow a crash to input to move from one step to
+another (but not across checkpoints).  Then, recovery would read the
+output that was produced beyond the checkpoint, run the circuit with
+the input produced beyond the checkpoint, and then write as output the
+difference between the new output and the previously produced output.
+
+With such an approach, there would be a one-to-one correspondence
+between input and output steps in ordinary operation.  Following
+recovery, the output following the checkpoint would correspond to the
+input following the checkpoint, but a more detailed correspondence
+would not be possible until the next checkpoint.
+</details>
+
+### Coordinator/worker synchronization
+
+We need some synchronization to allow all the workers to pause at the
+same step without blocking.  This isn't a big design consideration.
 
 <details><summary>Coordinator/worker synchronization details</summary>
 
-We need some synchronization to allow all the workers to pause at the
-same step without blocking.  Here's one possible approach.
+Here's one possible approach.
 
 Give each worker a cancellation token `token`, something like
 [`tokio_util::sync::CancellationToken`][1], plus a `state`:
