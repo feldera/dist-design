@@ -108,8 +108,9 @@ We implement fault tolerance by storing state in a database that is
 periodically checkpointed.  To recover, all of the workers load the
 most recent checkpoint and replay the input starting from that point,
 discarding any duplicate output that this produces.  Graceful shutdown
-and restart is a special case of crash recovery in which no input
-needs to be replayed.
+and restart is a special case of crash recovery where there is no
+output beyond the checkpoint and thus no input to be replayed
+(although there might be unprocessed input).
 
 This form of fault tolerance has the following requirements, each of
 which may be implemented in a variety of fashions:
@@ -329,15 +330,18 @@ we don't know how to reproduce).  There are a few ways:
   allows it, they could cooperate to use a transaction to atomically
   commit the division of input and output.
 
-<details><summary>Alternate design approach</summary>
+#### Alternate design approach
 
-In the system as described, a step has well-defined input and output,
-with the output always corresponding to the input.  Suppose we relax
-our definitions to allow a crash to input to move from one step to
-another (but not across checkpoints).  Then, recovery would read the
-output that was produced beyond the checkpoint, run the circuit with
-the input produced beyond the checkpoint, and then write as output the
-difference between the new output and the previously produced output.
+<details>In the system as described, a step has well-defined input and
+output, with the output always corresponding to the input.  Suppose we
+relax our definitions to allow a crash to input to move from one step
+to another (but not across checkpoints).  Then, recovery would read
+the output that was produced beyond the checkpoint, run the circuit
+with the input produced beyond the checkpoint, and then write as
+output the difference between the new output and the previously
+produced output.  (If the output implementation allows output to be
+deleted or marked obsolete, then that would work too.)  Then, it might
+be wise to produce a new checkpoint.
 
 With such an approach, there would be a one-to-one correspondence
 between input and output steps in ordinary operation.  Following
@@ -413,3 +417,185 @@ comes first.
 
 [1]: https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html
 
+# Scale in and out
+
+The computational resources in our distributed system are hosts and
+workers.  Distributed DBSP should support "scale out" to increase
+workers and hosts and "scale in" to decrease them.  For performance,
+input and state should be divided more or less evenly across workers
+regardless of the current scale.
+
+We have described distributed DBSP state, input, and output in
+abstract terms.  We need to be more specific about them for scaling.
+
+For [input/output synchronization](#inputoutput-synchronization),
+scale must be fixed at a given checkpoint.  That is, if a checkpoint
+requires recovery, then recovery must take place with the same scale
+that was initially used.  Thus, the state database must include scale
+information, and changing scale requires committing a checkpoint then
+updating the scale data without processing any input and immediately
+committing again.
+
+> 💡 The [alternate design approach](#alternate-design-approach) would
+allow recovery at different scale.
+
+## Scaling input
+
+[Input](#input) provides input to each worker.  As the number of
+workers increases or decreases, it must adapt to provide data to the
+new workers.  The distribution of data among workers does not affect
+correctness, because DBSP does not assume anything about the
+distribution of input.  For performance, data should be fairly well
+balanced among workers.
+
+The distribution of data among workers only affects performance up to
+the first time it is re-sharded with the "exchange" operator.  SQL
+programs are likely to re-shard data early on, so input scaling might
+affect performance in only a limited way.  We do not want it to be a
+bottleneck, but it also seems unwise to focus much effort on it.
+
+We currently expect DBSP input to arrive using the Kafka protocol.
+Kafka allows data to be divided into several partitions.  The number
+of partitions is essentially fixed (the admin can increase it but not
+decrease it).  Each worker reads data from some number of partitions.
+As scale changes, the assignment also changes to balance input across
+workers.
+
+## Scaling state
+
+When the number of workers changes, DBSP must also change how the
+"exchange" operator (described in [Distribution of
+computation](#distribution-of-computation)) re-shards data among
+workers.  Exchange occurs entirely inside DBSP, so the restrictions
+of, e.g., Kafka do not constrain it.
+
+However, computations that use an exchange operator also maintain
+state associated with keys, which must reside in the same worker as
+the key.  When scaling adjust exchanges so that a given key is sent to
+a different worker, the state associated with that key must also be
+moved.  To speed up scaling operations, we want to move as little
+state as possible.
+
+> 💡 If DBSP maintains state in a distributed database, instead of a
+> per-worker local database, then DBSP itself doesn't need to
+> explicitly move state data around, but the database still needs to
+> do it.
+
+DBSP currently divides data in exchange by hashing each key and taking
+`hash % W`, where `W` is the number of workers, as a worker index.
+This is a worst case for moving state: when the number of workers
+increases from `W` to `W+1`, `W/(W+1)` of the state moves.
+
+<details><summary>Some better approaches</summary>
+Let `S` be the number of "shards" for the exchange operator to divide
+data into.  Then the following algorithms seem like reasonable ones:
+
+* Fixed sharding: Choose a relatively large number `S`, e.g. 1024, of
+  "shards", numbered `0..S`.  Initially, for `W` workers, assign
+  approximately `S/W` shards to each worker, e.g. `0..333`,
+  `333..666`, and `666..1000` for `S = 1000` and `W = 3`.  To add a
+  new worker, assign it approximately `1/S` shards, taking them from
+  the existing workers so that the new division is approximately even,
+  e.g. a fourth worker might receive shards `0..83`, `333..416`, and
+  `666..750`.
+
+  This algorithm reassigns a minimum amount of traffic when `W`
+  changes.  As `W` approaches `S`, it divides data more and more
+  unevenly.  It requires a `S`-sized array to express the assignments.
+
+  This is essentially the same as the Kafka partitioning algorithm,
+  but we can afford for `S` to be larger than `P`.
+
+* Dynamic sharding: Choose `0 < k < 1` as the maximum inaccuracy in
+  sharding to tolerate, e.g. `k = 0.1` for 10% inaccuracy.  Let the
+  number of shards `S` be `(W/k).next_power_of_two()`.  Assign
+  approximately `S/W` shards to each worker.  To increase or decrease
+  the number of workers by 1, first recalculate `S`.  If this doubles
+  `S`, then double the bounds of every existing shard slice, so that,
+  e.g., `333..416` becomes `666..832`.  If this halves `S`, then halve
+  the bounds (and adjust assignments, if necessary, for a minimum
+  amount of disruption).  After adjusting `S`, assign workers to
+  shards such that the division is approximately even.
+
+  With this algorithm, shard data using the shard assigned to the data
+  hash's `S.ilog2()` most-significant bits.
+
+  This algorithm reassigns a minimum amount of traffic when `W`
+  changes.  It requires a `S`-sized array to express the assignments
+  (but the array size adapts appropriately for `W` and `k`).
+
+Fixed partitioning requires one to choose `S` appropriately, which
+might be hard.  Dynamic partitioning seems like a good approach.  It
+might take some work to implement it exactly correctly (it is possibly
+a novel algorithm), so it might not be worth implementing initially.
+
+The choice of algorithm only matters for adding or removing a few
+hosts at a time.  If the number of workers changes by more than 2× up
+or down, then most of the data needs to move anyway, which means that
+the choice of algorithm does not matter.
+</summary>
+
+## Layout changes
+
+We call the assignment of partitions and shards to workers, and
+workers to hosts a "layout".  Scale-in and scale-out are both examples
+of layout changes.
+
+Given fault tolerance, we can change the layout in a "cold" fashion
+by:
+
+1. Terminate DBSP workers for the old layout.
+2. Redistribute state as necessary.
+3. Start DBSP workers with the new layout.
+
+We can add or remove hosts in a "hot" fashion by:
+
+1. Start the hosts to be added, if any.
+2. Start copying state as necessary, while the circuit continues
+   executing.
+3. Stop the workers that are to be removed, initialize the workers
+   that are to be added, and pause the others.
+4. Finish copying the state.
+5. Update the assignment of partitions and shards to workers.
+6. Start the workers to be added, and un-pause the others.
+7. Stop the hosts to be removed.
+
+# Rolling upgrade
+
+It's desirable to be able to upgrade the DBSP software without
+disrupting an ongoing computation.  This section describes two
+approaches.
+
+Rolling upgrade does not support changing the computation or the
+dataflow graph that implements it.  This procedure is for upgrades
+that, e.g., fix a security vulnerability.
+
+## Via scale-in and scale-out
+
+Rolling upgrade of DBSP can leverage scale-out and scale-in as
+primitive operations.  This approach works if a spare host is
+available for the upgrade:
+
+1. Add a new host to the computation, using the new version of DBSP.
+2. Remove a host using the old version of DBSP.
+3. If any hosts remain using the old version, start over from step 1.
+
+If no spare host is available, swap steps 1 and 2.
+
+## Via layout change
+
+Iterative rolling upgrade, as described in the previous section, moves
+all DBSP state at least twice: step 1 moves `1/n` of the data to the
+added host, step 2 moves `1/n` of the data from the removed host, and
+the process is repeated `n` times.
+
+However, the layout change process is more general.  In a single step,
+one can add host A and remove host B and ensure that the data assigned
+to B is now assigned to A, so that only `1/n` of the data needs to
+move.  Over `n` iteration, only half as much data moves.  One could
+also do a single step that removes all of the old hosts and adds all
+of the new ones.
+
+Furthermore, if a given host has enough memory and other resources,
+one could start the new DBSP processes on the same hosts as the old
+ones and use a layout change that avoids moving any data at all.
