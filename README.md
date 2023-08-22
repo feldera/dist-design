@@ -102,49 +102,75 @@ input─┤                        ├─┤
 
 # Fault tolerance
 
-For fault tolerance, each worker maintains a database with the
-circuit's state.  Occasionally, a coordinator tells all of the workers
-to commit their databases way.  To recover from a fault, all of the
-workers load the most recently committed state snapshot and replay the
-input starting from that point, discarding any duplicate output that
-this produces.
+For DBSP, fault tolerance means that the system can recover from the
+crash of one or more workers while providing "exactly once" semantics.
+We implement fault tolerance by storing state in a database that is
+periodically checkpointed.  To recover, all of the workers load the
+most recent checkpoint and replay the input starting from that point,
+discarding any duplicate output that this produces.  Graceful shutdown
+and restart is a special case of crash recovery in which no input
+needs to be replayed.
 
-Input must be stored durably at least the latest snapshot has gone
-past it.
+This form of fault tolerance has the following requirements, each of
+which may be implemented in a variety of fashions:
+
+* A per-worker database that supports checkpointing.  See
+  [Database](#database).
+
+* A durable log of input.  See [Input](#input).
+
+* An output log, whose durability requirements arise from the needs of
+  the system that consumes the output.  See [Output](#output).
 
 ## Database
 
-Each worker has a database with a key-value interface.  The database
-must support up to two versions of data.  Let `Version` be a `u64`
-type representing a database version serial number:
+Each worker maintains its circuit's state in a database.  We describe
+the database as per-worker.  It could also be implemented as a single
+distributed database.
+
+Running the circuit queries and updates each database.  Occasionally,
+a coordinator tells all of the workers to commit their databases.  If
+all of them succeed, this forms a checkpoint that becomes the new
+basis for recovery.
+
+This section specifies the abstract interface that the database must
+implement.  It is a key-value database that must support two versions.
+Let `Version` be a `u64` type representing a database version serial
+number:
 
   * A new database has only one version, numbered 0, which is empty.
 
-  * Opening a database at any given version causes the other version,
-    if any, to be discarded.
+  * Opening a database at version `v` causes the other version, if
+    any, to be discarded.
 
-  * Committing a database that was opened with `open(version)` creates
-    a new version `version + 1`, either of which may be opened with
-    `open`.
+  * Committing a database that was opened at version `v` creates a new
+    version `v + 1`, either of which may be opened with `open`.
     
-  * A database closed by a crash or in any way other than `commit`
-    retains the version that was passed to `open()`.  If a crash
-    happens during `commit` then it's OK for both versions or just the
-    vesion passed to `open()` to be available on recovery.
+  * A database closed in any way other than `commit` retains the
+    version that was passed to `open`.  If a crash happens during
+    `commit` then it's OK for both versions or just the version passed
+    to `open` to be available on recovery.
+
+A database implementation presents the following interface to workers:
 
 * `fn versions() -> Range<Version>`
 
   Reports the versions that the database can open.  The returned
   `Range` has length 1 or 2.
   
-* `fn open(version: Version) -> Result<Database>`
+* `fn open(v: Version) -> Result<Database>`
 
-  Opens the database at the specified `version`.  The database
-  discards versions other than `version`.
+  Opens the database.  Reads and writes will occur in version `v + 1`,
+  which is initially a copy of version `v`.  The database discards
+  versions other than `v`.
   
 * `fn commit(db: Database) -> Result<()>`
 
-  Commits the current version of `db` and closes the database.
+  Commits the current version of `db` and closes the database.  After
+  a successful return, if `v` was the version passed to `open()`, then
+  versions `v` and `v + 1` may now be opened, where `v` has the same
+  contents as before and `v + 1` reflects any changes made while the
+  database was open.
   
 * `fn get(db: &mut Database, table, key) -> Result<value>`  
   `fn put(db: &mut Database, table, key, value) -> Result<()>`
@@ -159,13 +185,30 @@ type representing a database version serial number:
 
 ## Input
 
-Input and output are divided into numbered steps.  Let `Step` be a
-`u64` type representing an input or output step.
+A **step** is one full execution of the distributed circuit.  We
+number steps sequentially as `Step` (an alias for `u64`).  A step
+includes the circuit's input and output during that step.
 
-Each worker needs to obtain input for each step.  Input must be logged
-durably.  The assignment of input to a particular step must also be
-durable; for example, a crash must not cause additional data (that
-arrived post-crash, for example) to become part of a step.
+To execute a step in the distributed circuit, all of the workers need
+to obtain input for the step.  To ensure that recovery always produces
+the same output as previous runs, the input for a given step must be
+fixed.  That means that input must be logged durably.
+
+<details><summary>The division of input between steps must also be
+durable.</summary> That is, a crash must not move input from one step
+to another, even though such a change would ordinarily not change the
+integral of the distributed circuit output following the steps that
+changed.  This is because output may already have been produced for
+one (or more, or even all) workers for steps being replayed.
+
+> 💡 If this requirement yields performance or other problems, then it
+could be eliminated by complicating the recovery process.  Recovery
+would read the output that was produced beyond the checkpoint, run the
+circuit with the input produced beyond the checkpoint, and then
+produce as output the difference between the new output and the
+previously produced output.  This would ensure that the integral of
+the output is correct, but the output for the individual steps
+involved in recovery could be inconsistent with the input.</details>
 
 Input only need be durable until its step has become committed to the
 earliest version in its local database.
@@ -173,6 +216,8 @@ earliest version in its local database.
 Consider a worker to have input for steps `first..last`.  This might
 be an empty range if no new input has arrived since the earliest
 version of the local database.
+
+An input implementation presents the following interface to workers:
 
 * `fn read(step: Step) -> Result<Vec<ZSet>>`
 
@@ -197,6 +242,8 @@ their own expiration or deletion policies to output.
 Consider a worker to have output for steps `first..last`, which might
 be an empty range.
 
+An output implementation presents the following interface to workers:
+
 * `fn write(step: Step, output: Vec<ZSet> -> Result<()>`
 
   Writes `output` as the output for step number `step`:
@@ -207,8 +254,8 @@ be an empty range.
     * If `step` is in the range `first..last`, then `output` has
       already been produced before.  Now it has been produced
       redundantly during recovery.  Optionally, check that the new
-      output matches the old output and warn if it differs.  Discard
-      `output`.
+      output matches the old output and signal an error if it differs.
+      Discard `output`.
 
     * If `step == last`, then append it to the output stream and
       increment `last`.
@@ -217,7 +264,7 @@ be an empty range.
     
 ## Worker
 
-A worker has the following interface:
+A worker presents the following interface to the coordinator:
 
 * `fn versions() -> Range<Version>`
 
@@ -226,23 +273,22 @@ A worker has the following interface:
 * `fn start(version: Version)`
 
   Opens the local database with `open(version)`.  Sets a local
-  variable `step` using `get_step()` from the database.  Set `state`
-  to `Run`.
+  variable `step` using `get_step()` from the database.
   
-  Repeat the following loop until the coordinator calls `stop()`:
+  Repeats the following loop until the coordinator calls `stop()`:
   
-  - Get input by calling `read(step)`.
+  - Gets input by calling `read(step)`.
   
-  - Run the circuit for one step, obtaining `output`.  The DBSP
+  - Runs the circuit for one step, obtaining `output`.  The DBSP
     circuit coordinates across all of the workers on all of the hosts,
     exchanging data as necessary.
 
-  - Write output by calling `write(step, output)`.
+  - Writes output by calling `write(step, output)`.
   
-  - Increment `step`.
+  - Increments `step`.
   
-  Store `step` into the database using `set_step()`.  Commit the
-  database with `commit()`.  Set `state` to `Stopped`.
+  Stores `step` into the database using `set_step()`.  Commits the
+  database with `commit()`.  Sets `state` to `Stopped`.
   
 * `fn stop()`
 
@@ -252,23 +298,22 @@ A worker has the following interface:
 
 In a loop:
 
-- Call `versions()` on each worker to get its database version range,
-  intersects the results, and takes the maximum value `v`[^1].
+- Calls `versions()` on each worker to get its database version range,
+  intersects the results, and takes the maximum value `v`.  (If the
+  intersection is the empty set, that's a fatal error.)
   
   If this is not the first iteration of the loop, `v` should be one
   more than in the previous iteration.
   
-  [^1]: If the intersection is the empty set, that's a fatal error.
+- Calls `start(v)` on each worker.
 
-- Call `start(v)` on each worker.
+- Waits for an appropriate interval between checkpoints.
 
-- Wait for an appropriate interval between checkpoints.
-
-- Call `stop()` on each worker.
+- Calls `stop()` on each worker.
 
 ## Synchronization details
 
-<details><summary>Synchronization details</summary>
+<details><summary>Coordinator/worker synchronization details</summary>
 
 We need some synchronization to allow all the workers to pause at the
 same step without blocking.  Here's one possible approach.
@@ -286,20 +331,21 @@ enum State {
 }
 ```
 
-At the top of the loop in `start()`, instead of just getting input,
-consult `state`:
+`start()` initially sets its local variable `state` to `Run`.  Then,
+at the top of its loop, instead of just getting input, it consults
+`state`:
 
-* If `state` is `Run`, which is the common case, get input by
+* If `state` is `Run`, which is the common case, gets input by
   calling `read(step, &token)`.
 
-* If `state` is `Pause`, set it to `Paused(step)` and block until it
+* If `state` is `Pause`, sets it to `Paused(step)` and blocks until it
   becomes `Stop(_)`.
 
 * If `state` is `Stop(x)`:
 
-  - If `step < x`, get input by calling `read(step, &token)`.
+  - If `step < x`, gets input by calling `read(step, &token)`.
 
-  - If `step == x`, break out of the loop.
+  - If `step == x`, breaks out of the loop.
 
   - If `step > x`, fatal error.
 
@@ -307,8 +353,8 @@ Refine the worker interface with:
 
 * `fn pause() -> Step`
 
-  Sets `state` to `Pause`.  Cancel `token`.  Block until `state`
-  becomes `Paused(step)` and return `step`.
+  Sets `state` to `Pause`.  Cancels `token`.  Blocks until `state`
+  becomes `Paused(step)` and returns `step`.
 
 * `fn stop(step: Step)`
 
