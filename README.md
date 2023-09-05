@@ -250,6 +250,9 @@ An output implementation presents the following interface to workers:
     
     * `step > last` is an error.
     
+If convenient, the output implementation can expose step numbering to
+the clients consuming the output.
+
 ## Worker
 
 A worker presents the following interface to the coordinator:
