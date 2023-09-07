@@ -356,29 +356,27 @@ the division:
   on a step-by-step basis (a checkpoint spans an arbitrary number of
   steps).
 
-#### Alternate design approach
+- We can add a new database or log that just records the division of
+  input.
 
-We can avoid the need for synchronization if we drop some
-requirements.
+- We can adopt an entirely different design approach that avoid the
+  need to record the boundaries of input steps.  To do so, we need to
+  reconsider our requirement that a step has well-defined input and
+  output, with the output always corresponding to the input.  Suppose
+  we relax our definitions to allow a crash to move input from one
+  step to another (but not across checkpoints).  Then, recovery would
+  read the output that was produced beyond the checkpoint, run the
+  circuit with the input produced beyond the checkpoint, and then
+  write as output the difference between the new output and the
+  previously produced output.  (If the output implementation allows
+  output to be deleted or marked obsolete, then that would work too.)
+  Then, it might be wise to produce a new checkpoint.
 
-<details><summary>Details</summary>
-In the system as described, a step has well-defined input and
-output, with the output always corresponding to the input.  Suppose we
-relax our definitions to allow a crash to move input from one step
-to another (but not across checkpoints).  Then, recovery would read
-the output that was produced beyond the checkpoint, run the circuit
-with the input produced beyond the checkpoint, and then write as
-output the difference between the new output and the previously
-produced output.  (If the output implementation allows output to be
-deleted or marked obsolete, then that would work too.)  Then, it might
-be wise to produce a new checkpoint.
-
-With such an approach, there would be a one-to-one correspondence
-between input and output steps in ordinary operation.  Following
-recovery, the output following the checkpoint would correspond to the
-input following the checkpoint, but a more detailed correspondence
-would not be possible until the next checkpoint.
-</details>
+  With such an approach, there would be a one-to-one correspondence
+  between input and output steps in ordinary operation.  Following
+  recovery, the output following the checkpoint would correspond to
+  the input following the checkpoint, but a more detailed
+  correspondence would not be possible until the next checkpoint.
 
 ### Coordinator/worker synchronization
 
