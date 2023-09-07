@@ -146,7 +146,7 @@ number:
 
   * Committing a database that was opened at version `v` creates a new
     version `v + 1`, either of which may be opened with `open`.
-    
+
   * A database closed in any way other than `commit` retains the
     version that was passed to `open`.  If a crash happens during
     `commit` then it's OK for both versions or just the version passed
@@ -158,13 +158,13 @@ A database implementation presents the following interface to workers:
 
   Reports the versions that the database can open.  The returned
   `Range` has length 1 or 2.
-  
+
 * `fn open(v: Version) -> Result<Database>`
 
   Opens the database.  Reads and writes will occur in version `v + 1`,
   which is initially a copy of version `v`.  The database discards
   versions other than `v`.
-  
+
 * `fn commit(db: Database) -> Result<()>`
 
   Commits the current version of `db` and closes the database.  After
@@ -172,13 +172,15 @@ A database implementation presents the following interface to workers:
   versions `v` and `v + 1` may now be opened, where `v` has the same
   contents as before and `v + 1` reflects any changes made while the
   database was open.
-  
-* `fn get(db: &mut Database, table, key) -> Result<value>`  
+
+* `fn get(db: &mut Database, table, key) -> Result<value>`
+
   `fn put(db: &mut Database, table, key, value) -> Result<()>`
 
   Key-value pair read and write.
-  
-* `fn get_step(db: &Database) -> Result<Step>`  
+
+* `fn get_step(db: &Database) -> Result<Step>`
+
   `fn set_step(db: &mut Database, step: Step) -> Result<()>`
 
   Helpers for reading and writing the step number for the next
@@ -216,7 +218,7 @@ An input implementation presents the following interface to workers:
   Returns a Z-set per input handle.  If a single step batches input
   from multiple event arrivals for a given input handle, they are
   added together into a Z-set.
-  
+
 ## Output
 
 Each worker needs to produce output for each step.  DBSP can reproduce
@@ -235,10 +237,10 @@ An output implementation presents the following interface to workers:
 * `fn write(step: Step, output: Vec<ZSet> -> Result<()>`
 
   Writes `output` as the output for step number `step`:
-  
+
     * If `step` is in the range `0..first`, then `output` has already
       been produced before and discarded or deleted.  Discard it.
-      
+
     * If `step` is in the range `first..last`, then `output` has
       already been produced before.  Now it has been produced
       redundantly during recovery.  Optionally, check that the new
@@ -247,9 +249,9 @@ An output implementation presents the following interface to workers:
 
     * If `step == last`, then append it to the output stream and
       increment `last`.
-    
+
     * `step > last` is an error.
-    
+
 If convenient, the output implementation can expose step numbering to
 the clients consuming the output.
 
@@ -260,32 +262,32 @@ A worker presents the following interface to the coordinator:
 * `fn versions() -> Range<Version>`
 
   Delegates to the local database.
-  
+
 * `fn start(version: Version)`
 
   Opens the local database with `open(version)`.  Sets a local
   variable `step` using `get_step()` from the database.
-  
+
   Repeats the following loop until the coordinator calls `stop()`:
-  
+
   - Gets input by calling `read(step)`.
-  
+
   - Runs the circuit for one step, obtaining `output`.  The DBSP
     circuit coordinates across all of the workers on all of the hosts,
     exchanging data as necessary.
 
   - Writes output by calling `write(step, output)` (but see
     [Input/output synchronization](#inputoutput-synchronization)).
-  
+
   - Increments `step`.
-  
+
   Stores `step` into the database using `set_step()`.  Commits the
   database with `commit()`.
-  
+
 * `fn stop()`
 
   Stops the loop in `start()`.
-  
+
 ## Coordinator
 
 In a loop:
@@ -293,10 +295,10 @@ In a loop:
 - Calls `versions()` on each worker to get its database version range,
   intersects the results, and takes the maximum value `v`.  (If the
   intersection is the empty set, that's a fatal error.)
-  
+
   If this is not the first iteration of the loop, `v` should be one
   more than in the previous iteration.
-  
+
 - Calls `start(v)` on each worker.
 
 - Waits for an appropriate interval between checkpoints.
@@ -435,7 +437,7 @@ worker:
 
 - Call `pause()` on each worker and take `step` as the maximum
   return value.
-  
+
 - Call `stop(step)` on each worker.
 
 Refine the input interface by making `read()` take the cancellation
