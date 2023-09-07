@@ -317,22 +317,44 @@ moving input from one step to another would potentially require some
 of that already-produced output to change, which cannot be done.
 
 In practice, making the division of input into steps durable seems to
-require recording it, in the [Input](#input) implementation.
-Furthermore, for a given step, it must become durable before or at the
-same time as the step's output (otherwise, we could have output that
-we don't know how to reproduce).  There are a few ways:
+require recording it.  Furthermore, for a given step, the complete
+division of input must become durable before or at the same time as
+any part of the step's output (otherwise, we could have output that we
+don't know how to reproduce).  There are a few places we could record
+the division:
 
-- The Input implementation could block until recording the division of
-  input commits before returning.  This would add latency.
+- We could record the division in the Input implementation (e.g. write
+  it to a Kafka topic).  We have a few options for making sure that it
+  commits before the output does:
 
-- Input could provide a function to block until recording the division
-  of input commits.  The worker could call this after running the
-  circuit.  This would help to hide the latency.
+    - Input could block until recording the division of input commits
+      before returning.  This would add latency.
 
-- If the Input and Output implementations use underlying tech that
-  allows it, they could cooperate to use a transaction to atomically
-  commit the division of input and output.  This will work if the
-  input and output are in the same Kafka broker.
+    - Input could provide a function to block until recording the
+      division of input commits.  The worker could call this after
+      running the circuit and before writing the output.  This would
+      help to hide the latency.
+
+    - Input and Output could use a Kafka transaction to atomically
+      commit their changes together.  This will work if the input and
+      output are in the same Kafka broker.
+
+- We could attach the division of input to the output that corresponds
+  to it.  It's possible for some but not all of the output to become
+  durable (e.g. some Kafka partitions but not others), so the division
+  of input information would have to be redundantly attached to each
+  part that might independently become durable.  It would add the need
+  for the system to read back the tail of the output on restart or
+  recovery to discover how the input was divided.  This would in turn
+  mean that the system would add its own output durability
+  requirements (currently there are none).  We would also have to
+  consider writing output records even in the case where a given step
+  yields no output updates.
+
+- It's difficult to record the division of input in the state
+  database, because we don't require durability for the state database
+  on a step-by-step basis (a checkpoint spans an arbitrary number of
+  steps).
 
 #### Alternate design approach
 
