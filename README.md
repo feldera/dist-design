@@ -463,8 +463,9 @@ information, and changing scale requires committing a checkpoint then
 updating the scale data without processing any input and immediately
 committing again.
 
-> 💡 The [alternate design approach](#alternate-design-approach) would
-allow recovery at different scale.
+> 💡 The final design approach listed under [input/output
+synchronization](#inputoutput-synchronization) would allow recovery at
+different scale.
 
 ## Scaling input
 
