@@ -163,6 +163,13 @@ Consumer groups can be used two ways:
   The consumer uses `assign` and related consumer APIs to specify
   particular topics and partitions to read.
 
+Kafka documents that a consumer doesn't have to be in a consumer group
+if it doesn't need either of the above features.  In practice,
+sometimes it seems to be required anyway.  The Kafka broker durably
+stores the current offset and membership of each consumer group, so
+it's best to reuse consumer group names rather than generating a fresh
+random one on every connection.
+
 ## Transactions
 
 Kafka supports transactions.  A transaction includes reading from a
@@ -203,3 +210,15 @@ See also:
   * <https://kafka.apache.org/documentation/#semantics>
 
 [3]: https://www.confluent.io/blog/transactions-apache-kafka/
+
+## Pitfalls
+
+Consumer groups are required in cases where it seems the documentation
+says they are not needed.  See [Consumer groups](#consumer-groups)
+above.
+
+Doing a seek within a consumer before polling to read data causes
+strange errors, see [seek before poll].  Instead, specify the desired
+seek offset when assigning the partition to the consumer.
+
+[seek before poll]: https://github.com/confluentinc/confluent-kafka-go/issues/121#issuecomment-362308376
