@@ -211,6 +211,40 @@ See also:
 
 [3]: https://www.confluent.io/blog/transactions-apache-kafka/
 
+## End of file
+
+A Kafka consumer is always implicitly reading forward from its current
+position in each partition.  A consumer has an internal queue of
+events, which is initially empty, and a per-partition variable
+`eof_offset`, which is initially unset.
+
+A thread internal to Kafka receives messages from the Kafka broker
+that include an event, the event's offset, and the offset of the last
+event in the partition.  For each message, the thread appends the
+event to the queue.  In addition, if the event's offset is that of the
+last event in the partition, and `enable.partition.eof` is enabled,
+and `eof_offset` for the partition is anything other than the received
+event's offset, then it appends an `RD_KAFKA_RESP_ERR__PARTITION_EOF`
+error to the internal queue and sets `eof_offset` to the event's
+offset.
+
+`poll()` works by waiting until the internal queue becomes non-empty
+or until the timeout is reached.  If the timeout is reached, it
+returns nothing.  Otherwise, it returns the next event or error on the
+queue.
+
+`seek` to a new offset resets `eof_offset`.
+
+Thus, after a consumer receives the last event in a partition, it
+receives a `KafkaError::PartitionEOF` for that partition.  It won't
+receive another one for that partition until another event is appended
+to the partition.  If the consumer is faster than the producer, then
+it will receive an EOF indication after every event.
+
+Partition statistics report the `eof_offset` variable, but only
+reported periodically and not on demand, so this is not useful other
+than for monitoring.
+
 ## Pitfalls
 
 Consumer groups are required in cases where it seems the documentation
@@ -220,5 +254,8 @@ above.
 Doing a seek within a consumer before polling to read data causes
 strange errors, see [seek before poll].  Instead, specify the desired
 seek offset when assigning the partition to the consumer.
+
+The Java client library uses the name `fetch.max.wait.ms` for the
+feature that librdkafka calls `fetch.wait.max.ms`.
 
 [seek before poll]: https://github.com/confluentinc/confluent-kafka-go/issues/121#issuecomment-362308376
