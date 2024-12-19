@@ -16,8 +16,8 @@ coordinator can instantiate each of these adapters on a single host.
 This should be a safe place to start for every kind of input and
 output adapter, with some consideration:
 
-- For output adapters, we must insert a gather operator just before
-  the output operator.
+- For output adapters, just before the output operator, we must insert
+  a operator to gather to workers on a single host.
 
 - For input adapters, we should insert a shard operator just after the
   input operator.
@@ -220,7 +220,7 @@ then jump to step 3.
 In parallel, the coordinator runs a liveness check on each of the
 pipelines: periodically, it calls `state()` on each one of them.  If
 it does not return the expected result, then the coordinator restarts
-itself (see [Coordinator startup](#Coordinator-startup).  If it does
+itself (see [Coordinator startup](#Coordinator-startup)).  If it does
 not return within a deadline, then the coordinator calls `shutdown` on
 the pipeline and then restarts itself.
 
