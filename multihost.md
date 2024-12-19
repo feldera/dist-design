@@ -98,8 +98,8 @@ the Feldera processes on each of the hosts:
 > because the pipeline only starts a step when the coordinator tells
 > it.
 
-[1]: README.md#Coordinator
-[2]: README.md#Coordinator%2Fworker%20synchronization
+[1]: README.md#coordinator
+[2]: README.md#coordinatorworker-synchronization
 
 ## Protocol between coordinator and pipeline
 
