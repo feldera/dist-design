@@ -1,6 +1,6 @@
 # Understanding Kafka
 
-Kafka is a distributed system to store and buffer message.  In Kafka
+Kafka is a distributed system to store and buffer messages.  In Kafka
 parlance, clusters of "brokers" (servers) accept "events" (messages)
 from "producers", store them, and make them available to "consumers".
 
@@ -257,5 +257,9 @@ seek offset when assigning the partition to the consumer.
 
 The Java client library uses the name `fetch.max.wait.ms` for the
 feature that librdkafka calls `fetch.wait.max.ms`.
+
+Seeking to the high watermark minus one can end up at EOF because
+control messages (e.g. due to transactions) can cause Kafka to skip
+offsets.
 
 [seek before poll]: https://github.com/confluentinc/confluent-kafka-go/issues/121#issuecomment-362308376

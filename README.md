@@ -463,6 +463,9 @@ information, and changing scale requires committing a checkpoint then
 updating the scale data without processing any input and immediately
 committing again.
 
+> 💡 The number of workers must be the same for an initial run and
+recovery, but they can be divided across a different number of hosts.
+
 > 💡 The final design approach listed under [input/output
 synchronization](#inputoutput-synchronization) would allow recovery at
 different scale.
