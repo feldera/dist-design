@@ -131,9 +131,10 @@ The pipeline provides the following interface to the coordinator
 * `fn step(step)`: Runs the next step, `step`, which must be the step
   number provided to `open` plus the number of prior calls to `step`.
 
-* `fn checkpoint()`: Checkpoint at the current step.  If there was
-  already more than one checkpoint before this call, the pipeline may
-  discard all but the newest of them before creating the new one.
+* `fn checkpoint(step)`: Checkpoint at the current step, which must be
+  `step`.  If there was already more than one checkpoint before this
+  call, the pipeline may discard all but the newest of them before
+  creating the new one.
 
 The coordinator provides the following interface to each pipeline:
 
@@ -197,7 +198,7 @@ Normally, we start from step 1 below, but if coordinator startup
 detected that all of the pipelines have the state `Running(step)`,
 then jump to step 3.
 
-1. Wait until:
+1. Wait until one of the following occurs, to trigger a step:
 
   - Any pipeline node calls `replay(step)`.
 
@@ -206,15 +207,18 @@ then jump to step 3.
 
   - The clock tick timer expires.
 
-  If the checkpoint timer expires, trigger a checkpoint (see
-  [checkpoint procedure](#Checkpoint-procedure)) and start over.
+  Alternatively, if the checkpoint timer expires, trigger a checkpoint
+  instead.
 
-2. Call `step(step)` on each pipeline node.
+2. If a step was triggered, call `step(step)` on each pipeline node;
+   otherwise, a checkpoint was triggered, and call `checkpoint(step)`
+   on each pipeline node.
 
-3. Wait for `step` to return successfully on all of the pipeline
+3. Wait for `step` or `checkpoint` to return on all of the pipeline
    nodes.
 
-4. Start over from step 1.
+4. If all of the calls were successful, start over from step 1.  If
+   any of them failed, restart the coordinator.
 
 In parallel, the coordinator runs a liveness check on each of the
 pipelines: periodically, it calls `state()` on each one of them.  If
