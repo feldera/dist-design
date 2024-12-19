@@ -69,11 +69,8 @@ also provides services outside the Feldera cluster.  It provides the
 HTTP API to the pipeline manager, implementing each API in terms of
 the Feldera processes on each of the hosts:
 
-- `start`, `pause`, `shutdown`: Controls when the coordinator executes
-  steps.
-
-- `checkpoint`: Controls when the coordinator checkpoints the
-  pipeline.
+- `start`, `pause`, `shutdown`, `checkpoint`: Control the coordinator
+  main loop.
 
 - `query`: Requires creating a new `datafusion` `TableProvider` that
   can scan all of the pipeline nodes' tables.
@@ -81,7 +78,7 @@ the Feldera processes on each of the hosts:
 - `stats`, `metrics`: Pulls stats/metrics from all of the pipeline
   nodes and aggregates them.
 
-- `metadata`: I don't know what this is for.
+- `metadata`: Forwards to an arbitrary pipeline node.
 
 - `heap_profile`, `dump_profile`: Profiles one pipeline node
   specified in the call (default 0, I guess).
