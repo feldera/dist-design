@@ -394,4 +394,44 @@ Some ideas to increase efficiency:
     Batches being merged would be one-eighth the size.  Our mergers
     *should* adapt to this OK because of the approach they use now.
 
+- Micro-workers without migration: Scale out and in by adjusting the
+  amount of CPU available to a pipeline, without migrating anything at
+  all and without changing the number of workers.
+
+- Micro-workers with per-host scale-in/out: Scale out and in by
+  adjusting the amount of CPU available to a pipeline, without
+  migrating anything at all.  However, we do change the number of
+  workers on each host: we can "scale in" N workers into 1 worker by
+  merging their spines, initially by just adding all of their batches
+  into a single spine and then afterward the merger would fix it up so
+  it performed better.  "Scale out", which isn't as important, would
+  split them somehow.
+
 [^1]: For cold scaling, there is no in-memory data.
+
+### Storage aspects for migrating data
+
+In AWS EC2, we use EBS, which is expensive and local-only.  S3 is too
+high-latency for production use, and NVMe is not durable.
+
+Directions we could go for migrating data given the storage options:
+
+* Avoid the need to migrate data at all, using one of the above
+  scaling techniques that don't (i.e. "micro-workers without
+  migration" or "micro-workers with per-host scale-in/out").
+
+* Stick with our current sync-checkpoint-to-s3 and
+  sync-checkpoint-from-s3 approach.  This starts copying from EBS to
+  s3 after a checkpoint is complete, and it copies from s3 to EBS
+  before starting from a checkpoint.  It will be slow for a full
+  migration.
+
+* More closely integrate s3 sync rather than using rclone, by copying
+  to and from s3 in the background.  We could start running before
+  sync from s3 was complete, and we could start copying data to s3
+  before a checkpoint.  This would have less delay than currently.
+
+* Directly operate on s3 but use a local NVMe "instance store" as an
+  ephemeral cache.  Only a completed checkpoint to s3 would ensure
+  durability, so the ephemeral NVMe would simply serve as a high-speed
+  cache.  Exactly once configuration could use EBS for journaling.
