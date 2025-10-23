@@ -338,30 +338,60 @@ Some ideas to increase efficiency:
   makes operations slower, which is not a good tradeoff, since we're
   running a lot more often than we're scaling.
 
-The best idea I have is to divide scaling into two phases:
+- Divide scaling into two phases:
 
-* Phase 1 runs while the pipeline continues executing.  This phase
-  reads all of the data in the existing workers, batch by batch, and
-  passes an appropriate subset of it to the new worker.
+  * Phase 1 runs while the pipeline continues executing.  This phase
+    reads all of the data in the existing workers, batch by batch, and
+    passes an appropriate subset of it to the new worker.
 
-  > The data that will remain with the existing worker still has to be
-  discarded or filtered, same as before.
+    > The data that will remain with the existing worker still has to be
+    discarded or filtered, same as before.
 
-  This phase works on the largest batches first.  These batches are
-  the least likely to be merged, so they are a good target for
-  redistribution.  (It might make sense to disable starting new merges
-  on large batches in phase 1, or to only process batches that are not
-  currently being merged and then disable merging on them.  It is even
-  possible to make the merger produce multiple output batches based on
-  hash.)
+    This phase works on the largest batches first.  These batches are
+    the least likely to be merged, so they are a good target for
+    redistribution.  (It might make sense to disable starting new merges
+    on large batches in phase 1, or to only process batches that are not
+    currently being merged and then disable merging on them.  It is even
+    possible to make the merger produce multiple output batches based on
+    hash.)
 
-* Phase 2 runs when we have decided that phase 1 has reached a kind of
-  steady state, where new data coming in is yielding batches that need
-  to be divided by hash as quickly as we can divide them.  It seems
-  likely that this is when all the largest batches have been divided.
+  * Phase 2 runs when we have decided that phase 1 has reached a kind of
+    steady state, where new data coming in is yielding batches that need
+    to be divided by hash as quickly as we can divide them.  It seems
+    likely that this is when all the largest batches have been divided.
 
-  In phase 2, we halt the pipeline, divide the remaining batches by
-  hash (only small batches should be left), suspend, and then resume
-  with the new layout.
+    In phase 2, we halt the pipeline, divide the remaining batches by
+    hash (only small batches should be left), suspend, and then resume
+    with the new layout.
+
+- "Micro-workers": Fix the number of workers at a high number, such as
+  64 or 256 (8× or 32× the current default, respectively), and then
+  scale by migrating whole workers.  This is efficient for scaling.
+  For 64 workers assigned to 8 cores (plus 8 for background mergers),
+  the operational changes are:
+
+  * Exchange scales up from 8×8 to 64×64, a 64× increase.  Before the
+    result can be read, each worker waits for 8× as many messages to
+    come in, and each worker must do a 64-way merge instead of an
+    8-way merge.
+
+  * Scheduling 64 threads over 8 cores is more challenging than
+    scheduling 8 threads over 8 cores.  Maybe it makes sense to do
+    some kind of cooperative scheduling to keep the workers in
+    lockstep, although exchange will keep them somewhat synced anyhow.
+
+    > How do we interpret and implement CPU pinning?
+
+  * We have a few options regarding background merger threads.  We
+    could maintain the 1:1 background:foreground ratio, in which case
+    the mergers would compete with each other.  That could be a
+    positive effect if merger threads find themselves blocking on I/O.
+    Or we could use only a single background thread for multiple
+    foreground threads, a 1:8 ratio in this case.  This would prevent
+    competing on CPU although they might waste time blocking on I/O
+    more often.
+
+    Batches being merged would be one-eighth the size.  Our mergers
+    *should* adapt to this OK because of the approach they use now.
 
 [^1]: For cold scaling, there is no in-memory data.
