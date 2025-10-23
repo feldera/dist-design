@@ -300,7 +300,11 @@ within a trace, which is stored as a single file on each worker:
   that it no longer needs.  This requires fully reading the both index
   and data for the batch's keys, since sharding is done based on the
   hash of the key but the index is a B-tree and therefore every key
-  must be read and hashed.
+  must be read and hashed.  This can be done in a single pass with the
+  scan needed to copy data to the new worker.  It might also be
+  possible, by adding hashes to the storage file format, to
+  efficiently filter out the keys to be removed when the read the file
+  later.
 
 - Suppose the new worker can instead scan the trace for the data that
   it actually needs (for example, using an RPC interface provided by
@@ -309,8 +313,8 @@ within a trace, which is stored as a single file on each worker:
   because it does not copy all the data, but it still requires the new
   worker to read the entire index and data for the batch's keys.
 
-  The existing workers need to discard 25% of their data, same as the
-  previous case.
+  The existing workers need to discard or filter 25% of their data,
+  same as the previous case.
 
 These options mean that resharding data requires reading and hashing
 all the keys for all the batches, which is expensive.
@@ -340,10 +344,8 @@ The best idea I have is to divide scaling into two phases:
   reads all of the data in the existing workers, batch by batch, and
   passes an appropriate subset of it to the new worker.
 
-  > There are a few options to deal with the data that will remain
-  with the existing worker.  It can be written to a separate file
-  during this scan, or we can add hashes to the storage file format
-  and filter out data based on hash when we read the file.
+  > The data that will remain with the existing worker still has to be
+  discarded or filtered, same as before.
 
   This phase works on the largest batches first.  These batches are
   the least likely to be merged, so they are a good target for
